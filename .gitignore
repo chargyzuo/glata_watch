@@ -1,0 +1,36 @@
+# 本机身份配置、密钥、实验数据与构建产物不得进入 Git
+config.local.json
+*.local.json
+app_secret.json
+*secret*.json
+.env
+.env.*
+# 个人聊天记录、状态与日志
+oncall_chats/
+logs/
+.*cache*.json*
+.*state*.json*
+.*.lock
+.watch.pid
+.watch.lock
+.last_*
+*.jsonl
+*.log
+*_summary.md
+*_chat.txt
+dist/
+bin/vision_ocr
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+# 早期实验脚本不属于可维护发行版，保留本机但不上传
+fetch_glata_messages.sh
+# 编辑器密钥备份与内部检索材料同样不可提交
+.*secret*
+*.swp
+*.un~
+.one-context/
+.last_result.json
+.svc_index.json
+*.internal.local.md
