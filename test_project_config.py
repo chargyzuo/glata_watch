@@ -77,9 +77,15 @@ class ConfigTests(unittest.TestCase):
         project = Path(__file__).resolve().parent
         for name in ('start.sh', 'project_config.py'):
             (self.root / name).write_text((project / name).read_text())
-        env = dict(os.environ, PATH=os.environ.get('PATH', '/usr/bin:/bin'), GLATA_BG='1')
+        # setUp清空环境后不能落回系统Python/Xcode首次启动；固定当前矩阵解释器。
+        bindir = self.root / 'bin'
+        bindir.mkdir()
+        wrapper = bindir / 'python3'
+        wrapper.write_text('#!/bin/bash\nexec ' + __import__('shlex').quote(sys.executable) + ' "$@"\n')
+        wrapper.chmod(0o755)
+        env = dict(os.environ, PATH=str(bindir) + os.pathsep + '/usr/bin:/bin', GLATA_BG='1')
         result = subprocess.run(['/bin/bash','start.sh'], cwd=self.root, env=env,
-                                text=True, capture_output=True, timeout=5)
+                                text=True, capture_output=True, timeout=15)
         self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
         self.assertFalse((self.root / '.watch.pid').exists())
         self.assertNotIn('浏览器已', result.stdout)
