@@ -29,6 +29,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import read_oncall_chat as core
+from ai_task_guard import task_key, atomic_text, read_json, StateError
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 AI_SCRIPT = os.path.join(BASE_DIR, "oncall_ai_summary.py")
@@ -58,21 +59,21 @@ def log(msg):
 # ---------- 状态 ----------
 
 def load_state():
-    try:
-        with open(STATE_PATH, encoding="utf-8") as f:
-            s = json.load(f)
-            s.setdefault("seen", [])
-            s.setdefault("pending", {})
-            return s
-    except Exception:
-        return {"seen": [], "pending": {}}
+    # 损坏状态不能当成全新部署并清空，否则会丢失已完成任务和重复触发。
+    state = read_json(STATE_PATH)
+    state.setdefault("seen", [])
+    state.setdefault("pending", {})
+    state.setdefault("tasks", {})
+    if (not isinstance(state["seen"], list) or not isinstance(state["pending"], dict)
+            or not isinstance(state["tasks"], dict)):
+        raise StateError("监控去重状态字段无效，未清空覆盖")
+    return state
 
 
 def save_state(s):
     try:
         os.makedirs(core.ONCALL_DIR, exist_ok=True)
-        with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(s, f, ensure_ascii=False, indent=2)
+        atomic_text(STATE_PATH, json.dumps(s, ensure_ascii=False, indent=2) + "\n")
     except Exception as e:
         log("[warn] 状态写入失败: %s" % e)
 
@@ -136,9 +137,11 @@ def locate_group(runner, card, cache):
 
 # ---------- 后台 AI 任务 ----------
 
-def start_ai_job(chat_id, args, since=None):
+def start_ai_job(chat_id, args, since=None, analysis_key=None):
     """把阶段3 拉成独立后台进程，主循环不再等它。输出落 ai-<chat>-<时间>.log。"""
     cmd = [PY, AI_SCRIPT, "--chat-id", chat_id]
+    if analysis_key:
+        cmd += ["--task-key", analysis_key]
     if since:
         cmd += ["--since", since]
     if args.limit is not None:
@@ -155,6 +158,7 @@ def start_ai_job(chat_id, args, since=None):
     p = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, text=True,
                          start_new_session=True, cwd=BASE_DIR)
     return {"p": p, "fh": fh, "log_path": log_path, "chat_id": chat_id,
+            "task_key": analysis_key, "report_key": analysis_key or chat_id,
             "started": time.time(), "forced": False}
 
 
@@ -181,6 +185,10 @@ def collect_jobs(jobs, state, args):
             pass
         jobs.pop(mid, None)
         elapsed = time.time() - j["started"]
+        key = j.get("task_key") or state["pending"].get(mid, {}).get("task_key")
+        task = state.setdefault("tasks", {}).get(key)
+        if task:
+            task["status"] = "done" if rc in (0, 8) and not j["forced"] else "retry"
         if rc == 8:
             # 值班号群 230002 = 群已关闭/成员已被移出，工单 resolve 后的正常终态
             log("[skip] %s 值班号群不可读（工单已关闭），不再重试" % j["chat_id"])
@@ -192,7 +200,13 @@ def collect_jobs(jobs, state, args):
             if mid not in state["seen"]:
                 state["seen"].append(mid)
             state["pending"].pop(mid, None)
-            log("[file] %s" % os.path.join(core.ONCALL_DIR, "%s_summary.md" % j["chat_id"]))
+            log("[file] %s" % os.path.join(core.ONCALL_DIR, "%s_summary.md" % j.get("report_key", j["chat_id"])))
+        elif rc == 9:
+            # 重启监控时旧独立AI可能还活着，同任务锁阻止第二次调用；只等待，不耗失败次数。
+            previous = state["pending"].get(mid, {})
+            state["pending"][mid] = dict(previous, next_retry=time.time() + 10)
+            state["pending"][mid].pop("state", None)
+            log("[wait] 同一轮工单的旧 AI 仍在运行，10s 后检查，不重复调用")
         else:
             n = state["pending"].get(mid, {}).get("retry", 0) + 1
             log("[fail] %s 分析失败 (rc=%s, %.1fs)，第 %d 次，日志 %s"
@@ -201,9 +215,12 @@ def collect_jobs(jobs, state, args):
                 log("[giveup] %s 连续失败 %d 次，放弃" % (j["chat_id"], n))
                 if mid not in state["seen"]:
                     state["seen"].append(mid)
+                if task:
+                    task["status"] = "giveup"
                 state["pending"].pop(mid, None)
             else:
                 state["pending"][mid] = {"retry": n, "next_retry": time.time() + 120,
+                                         "task_key": key,
                                          "at": state["pending"].get(mid, {}).get("at")}
         save_state(state)
 
@@ -306,14 +323,32 @@ def process_new(runner, cache, args, state, jobs, baseline_only=False, notifier=
                 % (info.get("reporter_name") or info.get("ticket_no"), group.get("name"), chat_id,
                    (" start=%s" % since) if since else ""))
 
+            # 同工单同转人工轮次只由一张主卡片负责；重复通知登记seen，不启动第二个AI。
+            analysis_key = task_key(info.get("ticket_no"), info.get("transfer_time"), chat_id, since)
+            tasks = state.setdefault("tasks", {})
+            existing = tasks.get(analysis_key)
+            if existing and (existing.get("owner") != mid or existing.get("status") in ("done", "giveup")):
+                if mid not in state["seen"]:
+                    state["seen"].append(mid)
+                state["pending"].pop(mid, None)
+                log("[dedup] 工单 %s 同一转人工轮次已登记（%s），合并重复通知，不重复调用 AI"
+                    % (info.get("ticket_no") or "-", existing.get("status")))
+                save_state(state)
+                continue
+
             if len(jobs) >= args.workers:
                 # 已达并发上限：不登记，下一轮再投，避免把任务堆在无人监管的队列里
                 log("[wait] %d 单正在并行分析（上限 %d），%s 留到下一轮"
                     % (len(jobs), args.workers, chat_id))
                 continue
-            j = start_ai_job(chat_id, args, since=since)
+            previous_retry = state["pending"].get(mid, {}).get("retry", 0)
+            j = start_ai_job(chat_id, args, since=since, analysis_key=analysis_key)
+            j["task_key"] = analysis_key
+            j["report_key"] = analysis_key
             jobs[mid] = j
-            state["pending"][mid] = {"retry": 0, "next_retry": 0,
+            tasks[analysis_key] = {"owner": mid, "status": "running"}
+            state["pending"][mid] = {"retry": previous_retry, "next_retry": 0,
+                                     "task_key": analysis_key,
                                      "state": "running", "chat_id": chat_id,
                                      "at": card.get("create_time")}
             save_state(state)
@@ -321,8 +356,11 @@ def process_new(runner, cache, args, state, jobs, baseline_only=False, notifier=
                 % (chat_id, len(jobs), j["log_path"]))
         except Exception as e:
             log("[error] 处理卡片 %s 出错: %s" % (mid, e))
-            state["pending"][mid] = {"retry": state["pending"].get(mid, {}).get("retry", 0) + 1,
-                                     "next_retry": time.time() + 60}
+            previous = state["pending"].get(mid, {})
+            state["pending"][mid] = dict(previous,
+                                         retry=previous.get("retry", 0) + 1,
+                                         next_retry=time.time() + 60)
+            state["pending"][mid].pop("state", None)
             save_state(state)
     return cache
 
@@ -441,6 +479,9 @@ def main():
 if __name__ == "__main__":
     try:
         sys.exit(main() or 0)
+    except StateError as exc:
+        log("[error] %s；监控未启动，请检查本机去重状态" % exc)
+        sys.exit(4)
     except KeyboardInterrupt:
         log("已退出监控")
         sys.exit(0)

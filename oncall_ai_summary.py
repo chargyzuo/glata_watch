@@ -21,6 +21,10 @@ import os
 import subprocess
 import sys
 import time
+import re
+
+from ai_task_guard import (task_key, task_lock, TaskBusy, StateError, read_json,
+                           merge_json, atomic_text, completed_report, record_completed)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import read_oncall_chat as core
@@ -144,31 +148,45 @@ SESS_FILE = os.path.join(core.ONCALL_DIR, ".ai_sessions.json")
 
 
 def load_sessions():
-    try:
-        with open(SESS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    return read_json(SESS_FILE)
 
 
-def save_sessions(d):
-    try:
-        with open(SESS_FILE, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False, indent=1)
-    except Exception:
-        pass
+def save_sessions(updates):
+    # 仅合并本次任务的更新，不能拿旧的全量快照覆盖其他并发工单。
+    merge_json(SESS_FILE, updates)
 
 
 def extract_session_id(raw):
-    """doubao cli 在 -p/--resume 模式下第一行会输出 {"type":"session","session_id":...}。"""
+    """兼容 stdout/stderr 与超时异常中的字节输出，只识别会话元数据。"""
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
     for line in (raw or "").splitlines():
-        s = line.strip()
-        if s.startswith('{"type":"session"'):
-            try:
-                return json.loads(s).get("session_id")
-            except Exception:
-                return None
+        try:
+            item = json.loads(line.strip())
+        except ValueError:
+            continue
+        if isinstance(item, dict) and item.get("type") == "session":
+            return item.get("session_id")
     return None
+
+
+def remember_session(key, stdout, stderr):
+    sid = extract_session_id(stdout) or extract_session_id(stderr)
+    if sid:
+        save_sessions({key: sid})
+    return sid
+
+
+def run_doubao(cmd, timeout, key):
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        # run() 超时会收集已输出的stderr/stdout；失败也保存会话，重试使用 --resume。
+        remember_session(key, exc.output, exc.stderr)
+        raise
+    if not remember_session(key, result.stdout, result.stderr):
+        core.log("[warn] 未解析到 doubao 会话号，下次仍会新建会话")
+    return result
 
 
 def clean_doubao_output(raw):
@@ -199,6 +217,7 @@ def main():
     ap.add_argument("--timeout", type=int, default=300, help="doubao cli 超时秒数，默认 300（实测 100-120s）")
     ap.add_argument("--model", default=MODEL, help="模型，默认 DeepSeek V4.1 Flash")
     ap.add_argument("--dry-run", action="store_true", help="只打印提示词，不调 doubao")
+    ap.add_argument("--task-key", default=None, help="监控传入的同工单同轮次幂等键；通常无需手动指定")
     ap.add_argument("--raw", action="store_true", help="原样输出 doubao cli 的 stdout（不过滤元数据）")
     args = ap.parse_args()
 
@@ -212,6 +231,34 @@ def main():
         return 2
     core.log("[target] %s (%s)" % (chat_name or "-", chat_id))
 
+    if args.task_key and not re.fullmatch(r"ai_[0-9a-f]{32}", args.task_key):
+        ap.error("--task-key 格式无效")
+    analysis_key = args.task_key or task_key(ticket.get("ticket_no"), ticket.get("transfer_time"),
+                                             chat_id, args.since)
+    # 同一个群的新轮次不复用前一问题的输出文件；手动旧入口仍保持原文件名。
+    if args.task_key:
+        key = args.task_key
+    try:
+        with task_lock(core.ONCALL_DIR, analysis_key):
+            if not args.dry_run:
+                report = completed_report(core.ONCALL_DIR, analysis_key)
+                if report:
+                    core.log("[dedup] 同一轮工单 AI 已完成，复用报告: %s" % report)
+                    return 0
+            rc = analyze(args, t0, runner, chat_id, chat_name, key, ticket)
+            if rc == 0 and not args.dry_run:
+                record_completed(core.ONCALL_DIR, analysis_key,
+                                 os.path.join(core.ONCALL_DIR, "%s_summary.md" % key))
+            return rc
+    except TaskBusy:
+        core.log("[dedup] 同一轮工单 AI 仍在运行，本次未调用 doubao")
+        return 9
+    except (StateError, OSError) as exc:
+        core.log("[error] AI 幂等/会话状态处理失败（%s），未清空状态" % type(exc).__name__)
+        return 10
+
+
+def analyze(args, t0, runner, chat_id, chat_name, key, ticket):
     # 有权威转人工时间就直接按时间窗口拉，避免把上一段历史混进来
     since = args.since or core.iso_since((ticket or {}).get("transfer_time"))
     msgs = None
@@ -246,8 +293,7 @@ def main():
     chat_text = render_chat(msgs, args.limit, runner=runner, ocr=not args.no_ocr)
     os.makedirs(core.ONCALL_DIR, exist_ok=True)
     chat_path = os.path.join(core.ONCALL_DIR, "%s_chat.txt" % key)
-    with open(chat_path, "w", encoding="utf-8") as f:
-        f.write(chat_text)
+    atomic_text(chat_path, chat_text)
     core.log("[temp] 聊天记录已临时存储: %s (%d 字)" % (chat_path, len(chat_text)))
 
     # 只用纯聊天记录（Copilot 摘要段已略去，OpenAPI 取不到该消息）
@@ -269,17 +315,7 @@ def main():
             core.log("[ai] 复用会话 %s" % sid)
         else:
             cmd = [DOUBAO_BIN, "-p", prompt] + base_args
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout)
-        # 无论成败都记住会话号：失败时可能已经建了会话，下次直接复用它，不再新建。
-        # 注意：{"type":"session"} 这行走的是 stderr，stdout 里只有正文。
-        new_sid = extract_session_id(r.stdout) or extract_session_id(r.stderr)
-        if new_sid:
-            sess = load_sessions()
-            if sess.get(key) != new_sid:
-                sess[key] = new_sid
-                save_sessions(sess)
-        else:
-            core.log("[warn] 未解析到 doubao 会话号，下次仍会新建会话")
+        r = run_doubao(cmd, args.timeout, key)
     except FileNotFoundError:
         core.log("[error] 找不到 doubao cli，请先安装或设置 DOUBAO_CLI_BIN")
         return 3
@@ -308,11 +344,11 @@ def main():
         return 7
 
     summary_path = os.path.join(core.ONCALL_DIR, "%s_summary.md" % key)
-    with open(summary_path, "w", encoding="utf-8") as f:
-        f.write("# %s 值班号问题分析\n\n" % (chat_name or chat_id))
-        if ticket:
-            f.write("- 工单: %s\n- 报告人: %s\n" % (ticket.get("ticket_title"), ticket.get("reporter_name")))
-        f.write("- 群: %s (%s)\n\n---\n\n%s\n" % (chat_name or "-", chat_id, answer))
+    report_text = "# %s 值班号问题分析\n\n" % (chat_name or chat_id)
+    if ticket:
+        report_text += "- 工单: %s\n- 报告人: %s\n" % (ticket.get("ticket_title"), ticket.get("reporter_name"))
+    report_text += "- 群: %s (%s)\n\n---\n\n%s\n" % (chat_name or "-", chat_id, answer)
+    atomic_text(summary_path, report_text)
 
     print("")
     print("=" * 72)

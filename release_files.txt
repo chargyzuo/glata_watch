@@ -10,6 +10,8 @@ deploy_check.py
 fetch_glata_auto.py
 read_oncall_chat.py
 oncall_ai_summary.py
+ai_task_guard.py
+test_ai_dedup.py
 watch_and_run.py
 cdp_client.py
 vision_ocr.swift

@@ -24,6 +24,7 @@ TAGS = {
     "baseline": ("初始化", GREY),
     "ticket":   ("阶段2 工单号", GREEN),
     "oncall":   ("阶段2 值班号", GREEN),
+    "dedup":    ("分析去重", GREY),
     "queue":    ("阶段3 AI开始", YELLOW),
     "chat":     ("阶段3 拉记录", YELLOW),
     "session":  ("阶段3 会话", YELLOW),
