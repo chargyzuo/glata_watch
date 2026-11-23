@@ -203,6 +203,10 @@ class NotifyTests(unittest.TestCase):
         fakepy.chmod(0o755)
         fakecurl=bindir/'curl';fakecurl.write_text('#!/bin/bash\nprintf "glata.bytedance.com"\n');fakecurl.chmod(0o755)
         env=dict(os.environ,PATH=str(bindir)+os.pathsep+os.environ['PATH'],GLATA_BG='1',TEST_ARGS=str(self.root/'args.txt'))
+        # 使用真实Python进程保留watch_and_run.py参数；sleep会丢argv，无法验收PID身份校验。
+        sleeper=bindir/'watch_and_run.py'
+        sleeper.write_text('import time\ntime.sleep(30)\n')
+        fakepy.write_text('#!/bin/bash\nif [ "$1" = "watch_and_run.py" ]; then printf "%s\\n" "$@" > "$TEST_ARGS"; shift; exec '+__import__('shlex').quote(__import__('sys').executable)+' '+__import__('shlex').quote(str(sleeper))+' "$@"; fi\nexit 0\n')
         for argv,expected in [([],None),(['-at'],'human'),(['-at','all'],'all')]:
             r=subprocess.run(['/bin/bash','start.sh']+argv,cwd=self.root,env=env,capture_output=True,text=True,timeout=8)
             self.assertEqual(r.returncode,0,r.stdout+r.stderr)

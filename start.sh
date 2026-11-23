@@ -42,11 +42,19 @@ PID_FILE=".watch.pid"
 mkdir -p logs
 
 # 0. 配置只存在本机忽略文件；统一校验避免缺配置静默空转。
-python3 project_config.py --check || exit 4
+python3 project_config.py --check --quiet || exit 4
 
-# 1. 已经在跑就不重复启
+# 用户授权失效必须在任何“运行成功”提示和浏览器启动前失败。
+python3 deploy_check.py --preflight || exit 4
+
+# 1. 已经在跑就不重复启；PID 必须确实属于本监控，不能只检查进程存活。
 if [ -f "$PID_FILE" ] && ps -p "$(cat "$PID_FILE")" >/dev/null 2>&1; then
     CMD="$(ps -p "$(cat "$PID_FILE")" -o command= 2>/dev/null || true)"
+    case "${CMD}" in
+        *watch_and_run.py*) ;;
+        *) CMD="" ;;
+    esac
+    if [ -n "${CMD}" ]; then
     RUNNING_MODE="off"
     case "${CMD}" in
         *--notify-mode\ all*|*-at\ all*) RUNNING_MODE="all" ;;
@@ -58,6 +66,7 @@ if [ -f "$PID_FILE" ] && ps -p "$(cat "$PID_FILE")" >/dev/null 2>&1; then
     fi
     echo "监控已在运行 (pid $(cat "$PID_FILE"))，提醒模式=${RUNNING_MODE}，无需重复启动。"
     exit 0
+    fi
 fi
 
 # 2. 专用浏览器的启动/复用逻辑与读工单阶段统一，默认 headless 不弹窗。

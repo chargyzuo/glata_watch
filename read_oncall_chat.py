@@ -73,10 +73,17 @@ def log(msg):
 
 
 def find_lark_clis():
+    # 明确配置是硬绑定：路径错误/授权失败不能换另一个应用或内置 CLI。
+    pinned = get_setting("lark_cli_bin")
+    if pinned:
+        path = os.path.abspath(os.path.expanduser(pinned))
+        if not os.path.isfile(path) or not os.access(path, os.X_OK):
+            raise RuntimeError("固定的 lark_cli_bin 不可执行；请核对本机配置，不会回退候选")
+        return [path]
+    stable = os.path.expanduser("~/bin/lark-cli")
+    if os.path.isfile(stable) and os.access(stable, os.X_OK):
+        return [stable]
     cands = []
-    env = os.environ.get("LARK_CLI_BIN")
-    if env and os.access(env, os.X_OK):
-        cands.append(env)
     patterns = [
         os.path.expanduser(
             "~/Library/Application Support/LarkShell/aha/users/*/doubao/"
@@ -112,7 +119,38 @@ def lark_env():
     for k in list(env):
         if k.startswith("DOUBAO_OFFICE_"):
             env.pop(k)
+    env["LARKSUITE_CLI_NO_UPDATE_NOTIFIER"] = "1"
+    env["LARKSUITE_CLI_NO_SKILLS_NOTIFIER"] = "1"
     return env
+
+
+def lark_user_args(args):
+    """所有读取强制用户身份，不依赖 auto/default-as 的回退结果。"""
+    args = list(args)
+    has_user = False
+    for i, arg in enumerate(args):
+        if arg == "--as":
+            if i + 1 >= len(args) or args[i + 1] != "user":
+                raise ValueError("工单读取仅允许 --as user")
+            has_user = True
+        if arg.startswith("--as="):
+            if arg != "--as=user":
+                raise ValueError("工单读取仅允许 --as user")
+            has_user = True
+    return args if has_user else args + ["--as", "user"]
+
+
+def safe_lark_error(raw, returncode):
+    # 错误只保留诊断字段，不能把用户 ID / token 或授权链接写进常驻日志。
+    try:
+        error = json.loads(raw).get("error") or {}
+        if error.get("type") == "authentication":
+            return "lark-cli 用户授权不可用；用固定的独立 CLI 完成本人 OAuth 授权后重试"
+        detail = "%s %s" % (error.get("code", ""), error.get("message", ""))
+    except (ValueError, AttributeError):
+        detail = "CLI 返回非结构化错误；请在本机授权/自检入口排查"
+    detail = re.sub(r"\b(?:ou|oc|om)_[A-Za-z0-9]+", "[标识已隐藏]", detail)
+    return "lark-cli exit %d: %s" % (returncode, detail[:240])
 
 
 class LarkRunner(object):
@@ -122,17 +160,18 @@ class LarkRunner(object):
         self.last_err = ""
 
     def _run(self, lark, args, timeout=40):
-        r = subprocess.run([lark] + args, capture_output=True, text=True,
+        r = subprocess.run([lark] + lark_user_args(args), capture_output=True, text=True,
                            timeout=timeout, env=lark_env())
         if r.returncode != 0:
-            raise RuntimeError("lark-cli exit %d: %s" % (
-                r.returncode, (r.stderr or r.stdout or "")[:300].replace("\n", " ")))
+            raise RuntimeError(safe_lark_error(r.stderr or r.stdout or "", r.returncode))
         try:
             d = json.loads(r.stdout)
         except json.JSONDecodeError as e:
             raise RuntimeError("lark-cli 输出非 JSON: %s | %s" % (e, r.stdout[:200]))
         if not d.get("ok"):
-            raise RuntimeError("lark-cli 返回失败: %s" % str(d)[:260])
+            raise RuntimeError(safe_lark_error(r.stdout, r.returncode))
+        if d.get("identity") != "user":
+            raise RuntimeError("CLI 返回的身份不是 user；拒绝将机器人结果作为本人消息")
         return d
 
     def reset(self):
@@ -599,10 +638,13 @@ def ocr_image(runner, message_id, img_key, timeout=60):
             if not lark:
                 return ""
             # 下载命令的 stderr 可能带二进制，这里用字节模式且不解析输出
-            subprocess.run([lark, "im", "+messages-resources-download",
+            downloaded = subprocess.run([lark, "im", "+messages-resources-download",
                             "--message-id", message_id, "--file-key", img_key,
-                            "--type", "image", "--output", out_path],
-                           capture_output=True, timeout=timeout, env=lark_env())
+                            "--type", "image", "--as", "user", "--output", os.path.basename(out_path)],
+                           cwd=os.path.dirname(out_path), capture_output=True, timeout=timeout, env=lark_env())
+            if downloaded.returncode != 0:
+                log("[warn] 图片读取失败；未将失败下载内容送入 OCR")
+                return ""
         if not os.path.exists(out_path):
             return ""
         text = _ocr_vision(out_path, timeout)

@@ -1,5 +1,7 @@
 """集中配置与空输入回归：只使用合成值，不请求接口。"""
+import io
 import json
+from contextlib import redirect_stdout
 import os
 import subprocess
 import sys
@@ -89,6 +91,42 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
         self.assertFalse((self.root / '.watch.pid').exists())
         self.assertNotIn('浏览器已', result.stdout)
+
+    def test_check_success_prints_actionable_guidance_without_network_or_identity(self):
+        self.write(self.valid())
+        output = io.StringIO()
+        with patch.object(sys, 'argv', ['project_config.py','--check']), redirect_stdout(output), patch('subprocess.run') as network:
+            self.assertEqual(cfg.main(), 0)
+        network.assert_not_called()
+        text = output.getvalue()
+        for required in ('--preflight', 'auth login --scope', '--user-ids me', 'bash start.sh', '不代表用户已授权'):
+            self.assertIn(required, text)
+        for private in ('ou_fixture', 'ou_second', 'oc_fixture', '测试本人'):
+            self.assertNotIn(private, text)
+
+    def test_check_quiet_preserves_one_line_output_for_start(self):
+        self.write(self.valid());output = io.StringIO()
+        with patch.object(sys,'argv',['project_config.py','--check','--quiet']),redirect_stdout(output):
+            self.assertEqual(cfg.main(),0)
+        self.assertEqual(len(output.getvalue().splitlines()),1)
+        self.assertNotIn('auth login',output.getvalue())
+
+    def test_check_failure_prints_fix_and_preserves_exit_code(self):
+        output = io.StringIO()
+        with patch.object(sys,'argv',['project_config.py','--check']),redirect_stdout(output),patch('subprocess.run') as network:
+            self.assertEqual(cfg.main(),4)
+        network.assert_not_called()
+        self.assertIn('解决办法',output.getvalue())
+        self.assertIn('已有文件不要覆盖',output.getvalue())
+        self.assertNotIn('格式校验通过',output.getvalue())
+
+    def test_guidance_quotes_configured_cli_as_single_argument(self):
+        import shlex
+        cli = '/tmp/fixture cli;$(not-executed)'
+        self.write(dict(self.valid(),lark_cli_bin=cli));output = io.StringIO()
+        with redirect_stdout(output):cfg.check_guidance(True)
+        line=next(x.strip() for x in output.getvalue().splitlines() if 'auth status --json --verify' in x)
+        self.assertEqual(shlex.split(line),[cli,'auth','status','--json','--verify'])
 
     def test_release_rules_find_generated_identity_and_secret_without_echo(self):
         self.assertTrue(scan_text('oc_' + 'a' * 32))

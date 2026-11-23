@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parent
 RULES = {
     "真实资源标识": re.compile(r"\b(?:oc|ou|om|cli)_[0-9a-f]{16,}\b", re.I),
     "内部文档链接": re.compile(r"https://[^\s\"<>]*(?:larkoffice|feishu)\.(?:com|cn)/(?:wiki|docx|docs)/[A-Za-z0-9]{10,}"),
+    "飞书私有素材链接": re.compile(r"https://(?:[A-Za-z0-9.-]+\.)?(?:feishu\.(?:cn|com)|larkoffice\.com)/file/[A-Za-z0-9]{10,}"),
     "私钥正文": re.compile(r"-----BEGIN (?:OPENSSH |RSA |EC )?PRIVATE KEY-----"),
     "密钥字面量": re.compile(r"[\"']?(?:app_secret|user_access_token|tenant_access_token)[\"']?\s*[:=]\s*[\"']([A-Za-z0-9_-]{16,256})[\"']", re.I),
 }

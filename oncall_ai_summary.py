@@ -308,13 +308,13 @@ def analyze(args, t0, runner, chat_id, chat_name, key, ticket):
         # 同一张工单复用同一个 doubao 会话：重试时用 --resume，避免每次重试都新建一个
         # 同名会话（历史列表会被同一张单刷出好几条一模一样的记录）。
         sid = load_sessions().get(key)
-        base_args = ["--model", args.model,
-                     "--permission-mode", "always_allow", "-C", core.BASE_DIR]
+        # Native 参数必须位于业务参数前；当前 CLI 不接受 -p 后再传 -C。
+        cmd = [DOUBAO_BIN, "-C", core.BASE_DIR]
         if sid:
-            cmd = [DOUBAO_BIN, "--resume", str(sid), "-p", prompt] + base_args
+            cmd += ["--resume", str(sid)]
             core.log("[ai] 复用会话 %s" % sid)
-        else:
-            cmd = [DOUBAO_BIN, "-p", prompt] + base_args
+        cmd += ["-p", prompt, "--model", args.model,
+                "--permission-mode", "always_allow"]
         r = run_doubao(cmd, args.timeout, key)
     except FileNotFoundError:
         core.log("[error] 找不到 doubao cli，请先安装或设置 DOUBAO_CLI_BIN")

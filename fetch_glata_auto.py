@@ -72,32 +72,9 @@ def rotate_logs():
 
 
 def find_lark_clis():
-    """动态定位 lark-cli：环境变量优先，其次扫描 LarkShell 各 env 目录，按修改时间从新到旧。"""
-    cands = []
-    env = os.environ.get("LARK_CLI_BIN")
-    if env and os.access(env, os.X_OK):
-        cands.append(env)
-
-    patterns = [
-        os.path.expanduser(
-            "~/Library/Application Support/LarkShell/aha/users/*/doubao/"
-            "sandbox_envs_dir/envs/*/override_dlcs/bin/lark-cli"),
-        os.path.expanduser(
-            "~/Library/Application Support/LarkShell/aha/users/*/doubao/"
-            "sandbox_envs_dir/.prepared_packages/*/dlcs/*/bin/lark-cli"),
-    ]
-    found = []
-    for pat in patterns:
-        for p in glob.glob(pat):
-            if os.path.isfile(p) and os.access(p, os.X_OK):
-                found.append((os.path.getmtime(p), p))
-    found.sort(reverse=True)
-    seen = set(cands)
-    for _, p in found:
-        if p not in seen:
-            cands.append(p)
-            seen.add(p)
-    return cands[:5]
+    """与主监控共用固定 CLI，不因授权失效换应用。"""
+    import read_oncall_chat as core
+    return core.find_lark_clis()
 
 
 def read_cursor():
@@ -115,21 +92,12 @@ def write_cursor(pos):
 
 
 def fetch_messages(lark):
-    cmd = [lark, "im", "+chat-messages-list",
+    import read_oncall_chat as core
+    cmd = ["im", "+chat-messages-list",
            "--chat-id", CHAT_ID,
            "--page-size", str(PAGE_SIZE),
-           "--format", "json",
-           "--no-reactions"]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
-    if r.returncode != 0:
-        raise RuntimeError("lark-cli exit %d: %s" % (
-            r.returncode, (r.stderr or r.stdout or "")[:300].replace("\n", " ")))
-    try:
-        d = json.loads(r.stdout)
-    except json.JSONDecodeError as e:
-        raise RuntimeError("lark-cli 输出非 JSON: %s | %s" % (e, r.stdout[:200]))
-    if not d.get("ok"):
-        raise RuntimeError("lark-cli 返回失败: %s" % str(d)[:300])
+           "--format", "json", "--no-reactions"]
+    d = core.LarkRunner()._run(lark, cmd)
     return (d.get("data") or {}).get("messages") or []
 
 

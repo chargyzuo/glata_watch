@@ -45,42 +45,49 @@ def sh(cmd, timeout=20):
 
 
 def find_lark_clis():
-    """和 fetch_glata_auto.py 用同一套查找逻辑。"""
-    cands = []
-    env = os.environ.get("LARK_CLI_BIN")
-    if env and os.access(env, os.X_OK):
-        cands.append(env)
-    patterns = [
-        os.path.expanduser("~/Library/Application Support/LarkShell/aha/users/*/doubao/"
-                           "sandbox_envs_dir/envs/*/override_dlcs/bin/lark-cli"),
-        os.path.expanduser("~/Library/Application Support/LarkShell/aha/users/*/doubao/"
-                           "sandbox_envs_dir/.prepared_packages/*/dlcs/*/bin/lark-cli"),
-    ]
-    found = []
-    for pat in patterns:
-        for p in glob.glob(pat):
-            if os.path.isfile(p) and os.access(p, os.X_OK):
-                found.append((os.path.getmtime(p), p))
-    found.sort(reverse=True)
-    for _, p in found:
-        if p not in cands:
-            cands.append(p)
-    return cands
+    """与主监控共用固定路径解析，避免自检通过的是另一个 CLI。"""
+    import read_oncall_chat as core
+    return core.find_lark_clis()
 
 
 def lark_json(cli, args, timeout=60):
     import read_oncall_chat as core
-    r = subprocess.run([cli] + args + ["--format", "json"],
-                       capture_output=True, text=True, timeout=timeout, env=core.lark_env())
-    if r.returncode != 0:
-        raise RuntimeError((r.stderr or r.stdout or "")[:200].strip())
-    return json.loads(r.stdout)
+    return core.LarkRunner()._run(cli, args + ["--format", "json"], timeout=timeout)
+
+
+def preflight():
+    """只读验证后台真实环境；不归档消息、不修改游标、不触发任何任务。"""
+    import project_config
+    import read_oncall_chat as core
+    project_config.check_config()
+    runner = core.LarkRunner()
+    data = runner.call(["contact", "+search-user", "--user-ids", "me", "--format", "json"])
+    users = (data.get("data") or {}).get("users") or []
+    if len(users) != 1:
+        raise RuntimeError("本人查询未返回唯一用户；未启动监控")
+    me = users[0]
+    if (me.get("open_id") != project_config.get_setting("target_user_id") or
+            (me.get("localized_name") or "").strip() != project_config.get_setting("target_user_name").strip()):
+        raise RuntimeError("CLI 登录用户与本机本人配置不一致；先运行 deploy_check.py 获取同应用本人配置")
+    data = runner.call(["im", "+chat-messages-list", "--chat-id", project_config.get_setting("chat_id"),
+                        "--page-size", "1", "--no-reactions", "--format", "json"])
+    if not isinstance((data.get("data") or {}).get("messages"), list):
+        raise RuntimeError("Glata 读取响应缺少 messages；未启动监控")
+    print("[OK] 后台用户授权、本人与 Glata 可读性检查通过（不显示个人值，不触发 AI/电话）")
+    return 0
 
 
 def main():
     parser = argparse.ArgumentParser(description="部署自检；默认只读联网探测，--offline 只检查本机依赖和配置")
     parser.add_argument("--offline", action="store_true", help="不读取飞书消息/成员，不触发 AI 或电话")
+    parser.add_argument("--preflight", action="store_true", help="启动前仅检查本人授权与 Glata 可读性；不显示真实值")
     args = parser.parse_args()
+    if args.preflight:
+        try:
+            return preflight()
+        except (RuntimeError, ValueError, OSError) as exc:
+            print("[错误] 后台预检失败：%s" % exc)
+            return 4
     results.clear()
     print("=" * 64)
     print("Glata 工单自动分析 · 部署自检")
@@ -150,7 +157,7 @@ def main():
 
     clis = find_lark_clis()
     if not clis:
-        miss("lark-cli", "未找到，确认已安装并登录豆包桌面端")
+        miss("lark-cli", "未找到独立 CLI；安装后配置本机 lark_cli_bin")
         print("\n无法继续探测配置：lark-cli 不可用。")
         return 2
     ok("lark-cli", clis[0])

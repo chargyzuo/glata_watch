@@ -4,7 +4,18 @@
 
 ## 快速入口
 
-首次部署见 [DEPLOY.md](DEPLOY.md)。部署完成后只需要选择一种启动方式：
+首次部署见 [DEPLOY.md](DEPLOY.md)。GitHub 中为去内部图片与资料链接的公开部署副本；维护者本机可保留飞书单向同步原版，两者不反向覆盖飞书。当前官方 doubao CLI npm 制品的 macOS 路径限 ARM64，Intel 上的离线源码回归不等于 CLI 运行支持。
+
+每个新终端先进入本人项目并激活虚拟环境；采用 DEPLOY 用户目录安装时设置 CLI 路径：
+
+```bash
+cd ~/glata_watch
+source .venv/bin/activate
+export PATH="$HOME/.local/glata-tools/bin:$PATH"
+export DOUBAO_CLI_BIN="$HOME/.local/glata-tools/bin/doubao"
+```
+
+部署完成后以下三种启动方式任选一条，不连续执行：
 
 ```bash
 cd ~/glata_watch
@@ -59,6 +70,7 @@ python3 project_config.py --check
 
 | JSON 字段 | 环境变量 | 用途 |
 |---|---|---|
+| `lark_cli_bin` | `LARK_CLI_BIN` | 独立 CLI 的绝对路径；配置后禁止候选回落 |
 | `chat_id` | `GLATA_CHAT_ID` | 监听的 Glata 私聊 |
 | `target_user_name` | `GLATA_TARGET_USER_NAME` | 本人姓名，跨应用 ID 的匹配兜底 |
 | `target_user_id` | `GLATA_TARGET_USER_ID` | 本人主要 open_id |
@@ -69,9 +81,28 @@ python3 project_config.py --check
 
 程序没有维护者个人身份默认值；配置缺失应明确失败，不允许静默扫描他人的会话。跨应用 open_id 不同，`target_user_ids` 必须只包含自己已确认的 ID。姓名兜底可能有同名风险，应按实际卡片核对。
 
+### 后台用户授权与本人 ID
+
+后台读取使用独立官方 CLI 的持久用户 OAuth 授权，所有读取显式 `--as user`，不依赖豆包临时注入 token；电话仍走原机器人应用，不重置其 Secret。官方安装/登录入口见 `https://github.com/larksuite/cli`。应使用已核验支持 `auth` 的独立可执行文件，不要把客户端内置裁剪版当作可独立登录的版本。
+
+独立 CLI 登录后，在自己的终端运行（路径按本机实际安装位置）：
+
+```bash
+"$LARK_CLI_BIN" contact +search-user --user-ids me --as user --format json
+```
+
+只取 `data.users` 中唯一“本人”记录：`open_id` 填 `config.local.json` 的 `target_user_id`，`localized_name` 填 `target_user_name`。输出含个人信息，只留本机，不复制到公开文档/仓库。不同应用的 open_id 不同；不是机器人的 ID、报告人的 ID、工号或手机号。`target_user_ids` 仅补其他应用下已经确认属于自己的 ID，不能用它绕过登录用户校验。
+
+```bash
+python3 deploy_check.py              # 只读探测并打印配置建议
+python3 deploy_check.py --preflight  # 不显示真实值；验证固定 CLI 的本人及 Glata 可读性
+```
+
+`start.sh` 在启动浏览器与监控之前执行 `--preflight`。用户授权缺失、本人配置不一致、Glata 读取失败都停止启动；授权过期后需正常重新 OAuth，不改监听 ID、不复制临时 token、不清去重状态。更换 CLI 应用后重新取本人 ID，本机主 ID 要与该 CLI 查询结果一致。
+
 ### 其他运行配置
 
-- `LARK_CLI_BIN`：飞书 CLI 路径；否则按客户端安装目录探测。
+- `LARK_CLI_BIN`：固定独立飞书 CLI 路径，优先于 `lark_cli_bin`；未显式配置时优先 `~/bin/lark-cli`，最后保留旧客户端探测兼容。指定路径无效或授权失效时不会切换其他候选。
 - `DOUBAO_CLI_BIN`：豆包 CLI 路径；默认 `doubao`。
 - `GLATA_INTERVAL`：一键入口扫描周期秒数，默认 2。
 - `GLATA_BROWSER_MODE`：默认 `headless`，显式登录用 `headed`。

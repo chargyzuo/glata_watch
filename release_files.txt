@@ -23,6 +23,7 @@ ticket_notify.py
 test_ticket_notify.py
 test_cdp_browser.py
 test_project_config.py
+test_lark_auth.py
 test_workflow.py
 check_release.py
 release_files.txt

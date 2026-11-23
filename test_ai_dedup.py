@@ -196,6 +196,26 @@ with patch.object(core,'ONCALL_DIR',str(root)),patch.object(core,'log'),patch.ob
                 self.assertEqual(ai.analyze(args,time.time(),Mock(),'oc_fixture','fixture','fixture_key',{}),0)
                 self.assertIn('--resume',run.call_args.args[0])
                 self.assertIn('fixture_timeout',run.call_args.args[0])
+                argv = run.call_args.args[0]
+                self.assertEqual(argv[1:3], ['-C', core.BASE_DIR])
+                self.assertLess(argv.index('-C'), argv.index('--resume'))
+                self.assertLess(argv.index('-C'), argv.index('-p'))
+
+    def test_new_session_native_directory_precedes_business_args(self):
+        msgs=[{'content':'synthetic', 'sender':{'name':'fixture'}, 'create_time':'fixture'}]
+        args=SimpleNamespace(since=None,no_session=True,no_ocr=True,limit=0,dry_run=False,
+                             model=ai.MODEL,timeout=300,raw=False)
+        result=SimpleNamespace(returncode=0,stdout='synthetic answer',stderr='')
+        with patch.object(core,'ONCALL_DIR',str(self.root)),patch.object(core,'log'),\
+             patch.object(ai,'load_stage2_messages',return_value=msgs),\
+             patch.object(ai,'load_sessions',return_value={}),\
+             patch.object(ai,'run_doubao',return_value=result) as run:
+            self.assertEqual(ai.analyze(args,time.time(),Mock(),'oc_fixture','fixture','fixture_key',{}),0)
+            argv=run.call_args.args[0]
+            self.assertEqual(argv[:4],[ai.DOUBAO_BIN,'-C',core.BASE_DIR,'-p'])
+            self.assertNotIn('--resume',argv)
+            self.assertEqual(argv[argv.index('--model')+1],ai.MODEL)
+            self.assertEqual(argv.count('-C'),1)
 
 
 if __name__=='__main__':unittest.main()
