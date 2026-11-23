@@ -389,7 +389,7 @@ def main():
     ap.add_argument("--once", action="store_true", help="只跑一轮就退出（自测用）")
     ap.add_argument("--run-existing", action="store_true", help="启动时把已有未处理卡片也补跑")
     ap.add_argument("--model", default="DeepSeek V4.1 Flash", help="doubao 模型")
-    ap.add_argument("--timeout", type=int, default=300, help="单次 AI 超时秒数")
+    ap.add_argument("--timeout", type=int, default=420, help="单次 AI 超时秒数")
     ap.add_argument("--workers", type=int, default=3, help="同时并行分析的工单数，默认 3")
     ap.add_argument("--limit", type=int, default=None, help="透传给阶段3 的 --limit（默认不传=全部）")
     ap.add_argument("--no-ocr", action="store_true", help="透传 --no-ocr")

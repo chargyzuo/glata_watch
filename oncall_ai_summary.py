@@ -52,6 +52,16 @@ PROMPT_TPL = """你现在是一个字节跳动网络工程师，需要根据聊�
 {chat}
 """
 
+# 超时后同一会话已经收到过完整问题。重试只请求续写，避免把整段聊天记录和问题再发一遍，
+# 在豆包历史里形成两条一模一样的用户提问。
+TIMEOUT_CONTINUE_PROMPT = (
+    "上一条用户消息对应的分析在上一次客户端调用中超时中断。"
+    "请直接基于该消息继续完成，并输出完整最终答案；"
+    "不要重新读取聊天记录，不要重复检索已经查过的资料。"
+)
+TIMEOUT_HINT_TTL = 3600
+
+
 def render_chat(messages, limit, runner=None, ocr=True):
     """按时间正序渲染；limit<=0 表示全部。图片消息会附带本地 OCR 文本。"""
     rows = messages if limit <= 0 else messages[:limit]
@@ -151,6 +161,22 @@ def load_sessions():
     return read_json(SESS_FILE)
 
 
+def session_state(raw):
+    """兼容旧版纯字符串会话值和超时续写标记。"""
+    if isinstance(raw, str) and raw:
+        return raw, False
+    if isinstance(raw, dict):
+        sid = raw.get("session_id")
+        at = raw.get("timed_out_at")
+        fresh = bool(sid) and isinstance(at, (int, float)) and 0 <= time.time() - at <= TIMEOUT_HINT_TTL
+        return (str(sid) if sid else None), fresh
+    return None, False
+
+
+def session_id_for(key):
+    return session_state(load_sessions().get(key))[0]
+
+
 def save_sessions(updates):
     # 仅合并本次任务的更新，不能拿旧的全量快照覆盖其他并发工单。
     merge_json(SESS_FILE, updates)
@@ -181,8 +207,10 @@ def run_doubao(cmd, timeout, key):
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-        # run() 超时会收集已输出的stderr/stdout；失败也保存会话，重试使用 --resume。
-        remember_session(key, exc.output, exc.stderr)
+        # 保存会话号，但标记为“超时续写”：下一次只发继续指令，不重复完整问题。
+        sid = remember_session(key, exc.output, exc.stderr)
+        if sid:
+            save_sessions({key: {"session_id": sid, "timed_out_at": time.time()}})
         raise
     if not remember_session(key, result.stdout, result.stderr):
         core.log("[warn] 未解析到 doubao 会话号，下次仍会新建会话")
@@ -214,7 +242,7 @@ def main():
     ap.add_argument("--since", default=None,
                     help="聊天记录起始时间（ISO8601，如 2026-11-05T17:10:00+08:00）；不传则用工单页的转人工时间")
     ap.add_argument("--no-ocr", action="store_true", help="不对群内图片做本地 OCR")
-    ap.add_argument("--timeout", type=int, default=300, help="doubao cli 超时秒数，默认 300（实测 100-120s）")
+    ap.add_argument("--timeout", type=int, default=420, help="doubao cli 超时秒数，默认 420（复杂检索可能超过 300s）")
     ap.add_argument("--model", default=MODEL, help="模型，默认 DeepSeek V4.1 Flash")
     ap.add_argument("--dry-run", action="store_true", help="只打印提示词，不调 doubao")
     ap.add_argument("--task-key", default=None, help="监控传入的同工单同轮次幂等键；通常无需手动指定")
@@ -305,15 +333,15 @@ def analyze(args, t0, runner, chat_id, chat_name, key, ticket):
 
     core.log("[ai] 调用 doubao cli（model=%s）…" % args.model)
     try:
-        # 同一张工单复用同一个 doubao 会话：重试时用 --resume，避免每次重试都新建一个
-        # 同名会话（历史列表会被同一张单刷出好几条一模一样的记录）。
-        sid = load_sessions().get(key)
+        # 同一张工单复用同一个 doubao 会话；若上一次超时，只发续写指令，避免同一问题重复入会话。
+        sid, timed_out = session_state(load_sessions().get(key))
+        active_prompt = TIMEOUT_CONTINUE_PROMPT if timed_out else prompt
         # Native 参数必须位于业务参数前；当前 CLI 不接受 -p 后再传 -C。
         cmd = [DOUBAO_BIN, "-C", core.BASE_DIR]
         if sid:
             cmd += ["--resume", str(sid)]
-            core.log("[ai] 复用会话 %s" % sid)
-        cmd += ["-p", prompt, "--model", args.model,
+            core.log("[ai] 复用会话 %s%s" % (sid, "（超时续写，不重发完整问题）" if timed_out else ""))
+        cmd += ["-p", active_prompt, "--model", args.model,
                 "--permission-mode", "always_allow"]
         r = run_doubao(cmd, args.timeout, key)
     except FileNotFoundError:

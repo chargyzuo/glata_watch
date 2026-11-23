@@ -179,27 +179,32 @@ with patch.object(core,'ONCALL_DIR',str(root)),patch.object(core,'log'),patch.ob
         with patch.object(ai,'SESS_FILE',str(self.root/'sessions.json')):
             with self.assertRaises(subprocess.TimeoutExpired):
                 ai.run_doubao([sys.executable,'-c',code],1,'fixture_real')
-            self.assertEqual(ai.load_sessions()['fixture_real'],'fixture_real_timeout')
+            self.assertEqual(ai.session_state(ai.load_sessions()['fixture_real']),
+                             ('fixture_real_timeout', True))
 
     def test_timeout_saves_byte_metadata_and_next_attempt_resumes(self):
         with patch.object(ai,'SESS_FILE',str(self.root/'sessions.json')),patch.object(core,'log'):
-            timeout=subprocess.TimeoutExpired(['fixture'],300,output=b'',stderr=b'{"type": "session", "session_id": "fixture_timeout"}\n')
+            timeout=subprocess.TimeoutExpired(['fixture'],420,output=b'',stderr=b'{"type": "session", "session_id": "fixture_timeout"}\n')
             with patch.object(ai.subprocess,'run',side_effect=timeout):
-                with self.assertRaises(subprocess.TimeoutExpired):ai.run_doubao(['fixture'],300,'fixture_key')
-            self.assertEqual(ai.load_sessions()['fixture_key'],'fixture_timeout')
+                with self.assertRaises(subprocess.TimeoutExpired):ai.run_doubao(['fixture'],420,'fixture_key')
+            self.assertEqual(ai.session_state(ai.load_sessions()['fixture_key']),
+                             ('fixture_timeout', True))
             msgs=[{'content':'synthetic', 'sender':{'name':'fixture'}, 'create_time':'fixture'}]
             args=SimpleNamespace(since=None,no_session=True,no_ocr=True,limit=0,dry_run=False,
-                                 model='fixture',timeout=300,raw=False)
+                                 model='fixture',timeout=420,raw=False)
             result=SimpleNamespace(returncode=0,stdout='synthetic answer',stderr='{"type":"session","session_id":"fixture_timeout"}')
             with patch.object(core,'ONCALL_DIR',str(self.root)),patch.object(ai,'load_stage2_messages',return_value=msgs),\
                  patch.object(ai.subprocess,'run',return_value=result) as run:
                 self.assertEqual(ai.analyze(args,time.time(),Mock(),'oc_fixture','fixture','fixture_key',{}),0)
-                self.assertIn('--resume',run.call_args.args[0])
-                self.assertIn('fixture_timeout',run.call_args.args[0])
-                argv = run.call_args.args[0]
+                argv=run.call_args.args[0]
+                self.assertIn('--resume',argv)
+                self.assertIn('fixture_timeout',argv)
                 self.assertEqual(argv[1:3], ['-C', core.BASE_DIR])
                 self.assertLess(argv.index('-C'), argv.index('--resume'))
                 self.assertLess(argv.index('-C'), argv.index('-p'))
+                # 关键：超时重试只续写，不把完整聊天记录/问题重发到同一会话。
+                self.assertEqual(argv[argv.index('-p')+1], ai.TIMEOUT_CONTINUE_PROMPT)
+                self.assertNotIn('聊天记录内容', argv[argv.index('-p')+1])
 
     def test_new_session_native_directory_precedes_business_args(self):
         msgs=[{'content':'synthetic', 'sender':{'name':'fixture'}, 'create_time':'fixture'}]
