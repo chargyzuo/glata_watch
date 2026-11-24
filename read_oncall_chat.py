@@ -140,6 +140,33 @@ def lark_user_args(args):
     return args if has_user else args + ["--as", "user"]
 
 
+AUTH_REASONS = {
+    "token_missing": "本机找不到本人授权令牌（不是浏览器登录问题）",
+    "token_expired": "本人授权令牌已过期，CLI 未能恢复可用授权",
+    "token_revoked": "本人授权令牌已被撤销",
+    "refresh_token_expired": "本人授权的刷新令牌已过期",
+    "refresh_failed": "本人授权令牌刷新失败",
+    "need_user_authorization": "当前操作缺少本人授权",
+}
+
+
+class LarkAuthError(RuntimeError):
+    """只携带认证错误分类；不保留原始 token、ID、URL 或设备码。"""
+    def __init__(self, subtype=""):
+        self.reason = AUTH_REASONS.get(subtype, "CLI 拒绝本人认证，具体原因未返回")
+        super().__init__("lark-cli 用户授权不可用；原因：%s；用固定的独立 CLI 完成本人 OAuth 授权后重试" % self.reason)
+
+
+def lark_error(raw, returncode):
+    try:
+        error = json.loads(raw).get("error") or {}
+        if error.get("type") == "authentication":
+            return LarkAuthError(error.get("subtype", ""))
+    except (ValueError, AttributeError):
+        pass
+    return RuntimeError(safe_lark_error(raw, returncode))
+
+
 def safe_lark_error(raw, returncode):
     # 错误只保留诊断字段，不能把用户 ID / token 或授权链接写进常驻日志。
     try:
@@ -163,13 +190,13 @@ class LarkRunner(object):
         r = subprocess.run([lark] + lark_user_args(args), capture_output=True, text=True,
                            timeout=timeout, env=lark_env())
         if r.returncode != 0:
-            raise RuntimeError(safe_lark_error(r.stderr or r.stdout or "", r.returncode))
+            raise lark_error(r.stderr or r.stdout or "", r.returncode)
         try:
             d = json.loads(r.stdout)
         except json.JSONDecodeError as e:
             raise RuntimeError("lark-cli 输出非 JSON: %s | %s" % (e, r.stdout[:200]))
         if not d.get("ok"):
-            raise RuntimeError(safe_lark_error(r.stdout, r.returncode))
+            raise lark_error(r.stdout, r.returncode)
         if d.get("identity") != "user":
             raise RuntimeError("CLI 返回的身份不是 user；拒绝将机器人结果作为本人消息")
         return d
@@ -186,6 +213,9 @@ class LarkRunner(object):
                 d = self._run(p, args)
                 self.lark = p
                 return d
+            except LarkAuthError:
+                # 认证失败不换应用/身份；启动入口单独提供本机授权流程。
+                raise
             except Exception as e:
                 self.last_err = str(e)
                 continue

@@ -44,8 +44,8 @@ mkdir -p logs
 # 0. 配置只存在本机忽略文件；统一校验避免缺配置静默空转。
 python3 project_config.py --check --quiet || exit 4
 
-# 用户授权失效必须在任何“运行成功”提示和浏览器启动前失败。
-python3 deploy_check.py --preflight || exit 4
+# 授权失败时在本人终端显示原因、链接、二维码；成功复检后才启动。
+python3 deploy_check.py --preflight --auth-on-failure || exit 4
 
 # 1. 已经在跑就不重复启；PID 必须确实属于本监控，不能只检查进程存活。
 if [ -f "$PID_FILE" ] && ps -p "$(cat "$PID_FILE")" >/dev/null 2>&1; then

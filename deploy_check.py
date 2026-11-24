@@ -14,6 +14,9 @@ import os
 import shutil
 import subprocess
 import sys
+import fcntl
+import tempfile
+from urllib.parse import urlsplit
 
 NEW_TICKET_KEYWORD = "你有一条新工单需要处理"
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -77,14 +80,114 @@ def preflight():
     return 0
 
 
+AUTH_SCOPE = ("offline_access im:chat:read im:message:readonly "
+              "im:message.p2p_msg:get_as_user im:message.group_msg:get_as_user "
+              "contact:user.base:readonly contact:user:search")
+
+
+def auth_json(cli, args, timeout=60):
+    """授权输出仅在内存解析，绝不把原始响应写日志或回显。"""
+    import read_oncall_chat as core
+    try:
+        result = subprocess.run([cli] + args, capture_output=True, text=True,
+                                timeout=timeout, env=core.lark_env())
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("授权请求超时；未自动重试，请重新运行 bash start.sh") from None
+    try:
+        data = json.loads(result.stdout or result.stderr)
+    except ValueError:
+        raise RuntimeError("授权命令未返回有效 JSON；请核对独立 CLI 版本和网络") from None
+    if result.returncode or data.get("ok") is False:
+        raise core.lark_error(result.stderr or result.stdout, result.returncode)
+    return data
+
+
+def recover_user_auth(error):
+    """只由显式本机启动入口调用；独立 --preflight 仍然只读。"""
+    import read_oncall_chat as core
+    print("[原因] %s" % error.reason, flush=True)
+    if not sys.stdin.isatty():
+        print("[未授权] 当前无交互终端；请在本机终端运行 bash start.sh 扫码，未启动监控。")
+        return 4
+    paths = core.find_lark_clis()
+    if len(paths) != 1:
+        print("[错误] 先在 config.local.json 固定独立 lark_cli_bin；不对临时候选发起授权。")
+        return 4
+    cli = paths[0]
+    logdir = os.path.join(ROOT, "logs")
+    os.makedirs(logdir, exist_ok=True)
+    lockpath = os.path.join(logdir, ".lark-user-auth.local.lock")
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    with os.fdopen(os.open(lockpath, flags, 0o600), "a+") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("[未授权] 另一个终端正在授权，请在原终端完成；未生成重复链接。")
+            return 4
+        # 拿锁期间另一启动可能已完成授权；只读再查，不生成多余二维码。
+        try:
+            return preflight()
+        except core.LarkAuthError:
+            pass
+        data = auth_json(cli, ["auth", "login", "--scope", AUTH_SCOPE, "--no-wait", "--json"])
+        url, device = data.get("verification_url"), data.get("device_code")
+        if not isinstance(url, str) or not isinstance(device, str) or not device:
+            raise RuntimeError("授权响应缺少链接/设备码；未保存或回显原始响应")
+        parsed = urlsplit(url)
+        if (parsed.scheme != "https" or parsed.hostname not in ("accounts.feishu.cn", "accounts.larksuite.com")
+                or parsed.username or parsed.password or parsed.port not in (None, 443)
+                or any(ord(c) < 32 or ord(c) == 127 for c in url)):
+            raise RuntimeError("授权链接不是支持的飞书 HTTPS 地址；未打开或显示")
+        print("\n授权链接（本次有效，过期请重新运行 bash start.sh）：\n%s" % url, flush=True)
+        fd, image = tempfile.mkstemp(prefix="lark-user-auth-", suffix=".local.png", dir=logdir)
+        os.close(fd)
+        try:
+            relative = os.path.relpath(image, ROOT)
+            qr = subprocess.run([cli, "auth", "qrcode", url, "--output", relative, "--size", "512"],
+                                cwd=ROOT, env=core.lark_env(), capture_output=True, text=True, timeout=30)
+            if qr.returncode or os.path.getsize(image) == 0:
+                print("[提示] 二维码生成失败；请打开上面的授权链接，未降低权限或切换身份。", flush=True)
+            else:
+                os.chmod(image, 0o600)
+                print("二维码：%s" % image, flush=True)
+                opened = subprocess.run(["open", image], capture_output=True, timeout=10)
+                if opened.returncode:
+                    print("[提示] 无法自动显示二维码，请手动打开上述图片或授权链接。", flush=True)
+            print("请本人扫码确认，并允许 CLI 的钥匙串访问；正在等待授权，Ctrl+C 可取消。", flush=True)
+            auth_json(cli, ["auth", "login", "--device-code", device, "--json"], timeout=660)
+            # 只在持久化令牌与同应用身份/会话真实可读后允许启动。
+            preflight()
+            print("[OK] 本机本人授权已保存，继续启动。", flush=True)
+            return 0
+        finally:
+            if os.path.isfile(image):
+                os.unlink(image)  # 只删除本次临时二维码，不动教程截图/凭证/业务状态。
+
+
 def main():
     parser = argparse.ArgumentParser(description="部署自检；默认只读联网探测，--offline 只检查本机依赖和配置")
     parser.add_argument("--offline", action="store_true", help="不读取飞书消息/成员，不触发 AI 或电话")
     parser.add_argument("--preflight", action="store_true", help="启动前仅检查本人授权与 Glata 可读性；不显示真实值")
+    parser.add_argument("--auth-on-failure", action="store_true", help="仅配合 --preflight：交互终端授权失败时显示原因/链接/二维码并等待本人扫码")
     args = parser.parse_args()
+    if args.auth_on_failure and (not args.preflight or args.offline):
+        parser.error("--auth-on-failure 仅可与 --preflight 配合，不支持 --offline")
     if args.preflight:
+        import read_oncall_chat as core
         try:
             return preflight()
+        except core.LarkAuthError as exc:
+            if args.auth_on_failure:
+                try:
+                    return recover_user_auth(exc)
+                except KeyboardInterrupt:
+                    print("\n[未授权] 已取消；未启动监控，未清理业务状态。")
+                    return 4
+                except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as failure:
+                    print("[错误] 本机授权未完成：%s；未启动监控。" % failure)
+                    return 4
+            print("[错误] 后台预检失败：%s" % exc)
+            return 4
         except (RuntimeError, ValueError, OSError) as exc:
             print("[错误] 后台预检失败：%s" % exc)
             return 4
